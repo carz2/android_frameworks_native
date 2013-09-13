@@ -45,8 +45,9 @@
 #include <private/gui/LayerState.h>
 
 #include "Barrier.h"
-#include "MessageQueue.h"
 #include "DisplayDevice.h"
+#include "FrameTracker.h"
+#include "MessageQueue.h"
 
 #include "DisplayHardware/HWComposer.h"
 
@@ -59,11 +60,8 @@ class DisplayEventConnection;
 class EventThread;
 class IGraphicBufferAlloc;
 class Layer;
-class LayerBase;
-class LayerBaseClient;
 class LayerDim;
-class LayerScreenshot;
-class SurfaceTextureClient;
+class Surface;
 
 // ---------------------------------------------------------------------------
 
@@ -102,24 +100,13 @@ public:
     // force full composition on all displays
     void repaintEverything();
 
-    // renders content on given display to a texture. thread-safe version.
-    status_t renderScreenToTexture(uint32_t layerStack, GLuint* textureName,
-        GLfloat* uOut, GLfloat* vOut);
-
-    // renders content on given display to a texture, w/o acquiring main lock
-    status_t renderScreenToTextureLocked(uint32_t layerStack, GLuint* textureName,
-        GLfloat* uOut, GLfloat* vOut);
-
     // returns the default Display
     sp<const DisplayDevice> getDefaultDisplayDevice() const {
-        return getDisplayDevice(mDefaultDisplays[DisplayDevice::DISPLAY_PRIMARY]);
+        return getDisplayDevice(mBuiltinDisplays[DisplayDevice::DISPLAY_PRIMARY]);
     }
 
     // utility function to delete a texture on the main thread
     void deleteTextureAsync(GLuint texture);
-
-    // allocate a h/w composer display id
-    int32_t allocateHwcDisplayId(DisplayDevice::DisplayType type);
 
     // enable/disable h/w composer event
     // TODO: this should be made accessible only to EventThread
@@ -132,15 +119,13 @@ public:
 
     // for debugging only
     // TODO: this should be made accessible only to HWComposer
-    const Vector< sp<LayerBase> >& getLayerSortedByZForHwcDisplay(int disp);
+    const Vector< sp<Layer> >& getLayerSortedByZForHwcDisplay(int id);
 
 private:
     friend class Client;
     friend class DisplayEventConnection;
-    friend class LayerBase;
-    friend class LayerBaseClient;
     friend class Layer;
-    friend class LayerScreenshot;
+    friend class SurfaceTextureLayer;
 
     // We're reference counted, never destroy SurfaceFlinger directly
     virtual ~SurfaceFlinger();
@@ -149,7 +134,7 @@ private:
      * Internal data structures
      */
 
-    class LayerVector : public SortedVector<sp<LayerBase> > {
+    class LayerVector : public SortedVector< sp<Layer> > {
     public:
         LayerVector();
         LayerVector(const LayerVector& rhs);
@@ -163,7 +148,7 @@ private:
         bool isMainDisplay() const { return type == DisplayDevice::DISPLAY_PRIMARY; }
         bool isVirtualDisplay() const { return type >= DisplayDevice::DISPLAY_VIRTUAL; }
         DisplayDevice::DisplayType type;
-        sp<ISurfaceTexture> surface;
+        sp<IGraphicBufferProducer> surface;
         uint32_t layerStack;
         Rect viewport;
         Rect frame;
@@ -195,12 +180,12 @@ private:
             const Vector<DisplayState>& displays, uint32_t flags);
     virtual void bootFinished();
     virtual bool authenticateSurfaceTexture(
-        const sp<ISurfaceTexture>& surface) const;
+        const sp<IGraphicBufferProducer>& bufferProducer) const;
     virtual sp<IDisplayEventConnection> createDisplayEventConnection();
-    virtual status_t captureScreen(const sp<IBinder>& display, sp<IMemoryHeap>* heap,
-        uint32_t* width, uint32_t* height, PixelFormat* format,
-        uint32_t reqWidth, uint32_t reqHeight, uint32_t minLayerZ,
-        uint32_t maxLayerZ);
+    virtual status_t captureScreen(const sp<IBinder>& display,
+            const sp<IGraphicBufferProducer>& producer,
+            uint32_t reqWidth, uint32_t reqHeight,
+            uint32_t minLayerZ, uint32_t maxLayerZ, bool isCpuConsumer);
     // called when screen needs to turn off
     virtual void blank(const sp<IBinder>& display);
     // called when screen is turning back on
@@ -266,39 +251,36 @@ private:
     /* ------------------------------------------------------------------------
      * Layer management
      */
-    sp<ISurface> createLayer(ISurfaceComposerClient::surface_data_t* params,
-            const String8& name, const sp<Client>& client,
-            uint32_t w, uint32_t h, PixelFormat format, uint32_t flags);
+    status_t createLayer(const String8& name, const sp<Client>& client,
+            uint32_t w, uint32_t h, PixelFormat format, uint32_t flags,
+            sp<IBinder>* handle, sp<IGraphicBufferProducer>* gbp);
 
-    sp<Layer> createNormalLayer(const sp<Client>& client,
-            uint32_t w, uint32_t h, uint32_t flags, PixelFormat& format);
+    status_t createNormalLayer(const sp<Client>& client, const String8& name,
+            uint32_t w, uint32_t h, uint32_t flags, PixelFormat& format,
+            sp<IBinder>* outHandle, sp<IGraphicBufferProducer>* outGbp,
+            sp<Layer>* outLayer);
 
-    sp<LayerDim> createDimLayer(const sp<Client>& client,
-            uint32_t w, uint32_t h, uint32_t flags);
-
-    sp<LayerScreenshot> createScreenshotLayer(const sp<Client>& client,
-            uint32_t w, uint32_t h, uint32_t flags);
+    status_t createDimLayer(const sp<Client>& client, const String8& name,
+            uint32_t w, uint32_t h, uint32_t flags, sp<IBinder>* outHandle,
+            sp<IGraphicBufferProducer>* outGbp, sp<Layer>* outLayer);
 
     // called in response to the window-manager calling
     // ISurfaceComposerClient::destroySurface()
-    // The specified layer is first placed in a purgatory list
-    // until all references from the client are released.
-    status_t onLayerRemoved(const sp<Client>& client, SurfaceID sid);
+    status_t onLayerRemoved(const sp<Client>& client, const sp<IBinder>& handle);
 
     // called when all clients have released all their references to
     // this layer meaning it is entirely safe to destroy all
     // resources associated to this layer.
-    status_t onLayerDestroyed(const wp<LayerBaseClient>& layer);
+    status_t onLayerDestroyed(const wp<Layer>& layer);
 
     // remove a layer from SurfaceFlinger immediately
-    status_t removeLayer(const sp<LayerBase>& layer);
+    status_t removeLayer(const sp<Layer>& layer);
 
     // add a layer to SurfaceFlinger
-    ssize_t addClientLayer(const sp<Client>& client,
-        const sp<LayerBaseClient>& lbc);
-
-    status_t removeLayer_l(const sp<LayerBase>& layer);
-    status_t purgatorizeLayer_l(const sp<LayerBase>& layer);
+    void addClientLayer(const sp<Client>& client,
+            const sp<IBinder>& handle,
+            const sp<IGraphicBufferProducer>& gbc,
+            const sp<Layer>& lbc);
 
     /* ------------------------------------------------------------------------
      * Boot animation, on/off animations and screen capture
@@ -306,10 +288,24 @@ private:
 
     void startBootAnim();
 
-    status_t captureScreenImplLocked(const sp<IBinder>& display, sp<IMemoryHeap>* heap,
-        uint32_t* width, uint32_t* height, PixelFormat* format,
-        uint32_t reqWidth, uint32_t reqHeight, uint32_t minLayerZ,
-        uint32_t maxLayerZ);
+    void renderScreenImplLocked(
+            const sp<const DisplayDevice>& hw,
+            uint32_t reqWidth, uint32_t reqHeight,
+            uint32_t minLayerZ, uint32_t maxLayerZ,
+            bool yswap);
+
+    status_t captureScreenImplLocked(
+            const sp<const DisplayDevice>& hw,
+            const sp<IGraphicBufferProducer>& producer,
+            uint32_t reqWidth, uint32_t reqHeight,
+            uint32_t minLayerZ, uint32_t maxLayerZ);
+
+    status_t captureScreenImplCpuConsumerLocked(
+            const sp<const DisplayDevice>& hw,
+            const sp<IGraphicBufferProducer>& producer,
+            uint32_t reqWidth, uint32_t reqHeight,
+            uint32_t minLayerZ, uint32_t maxLayerZ);
+
 
     /* ------------------------------------------------------------------------
      * EGL
@@ -328,6 +324,9 @@ private:
     // called when starting, or restarting after system_server death
     void initializeDisplays();
 
+    // Create an IBinder for a builtin display and add it to current state
+    void createBuiltinDisplayLocked(DisplayDevice::DisplayType type);
+
     // NOTE: can only be called from the main thread or with mStateLock held
     sp<const DisplayDevice> getDisplayDevice(const wp<IBinder>& dpy) const {
         return mDisplays.valueFor(dpy);
@@ -341,6 +340,9 @@ private:
     // mark a region of a layer stack dirty. this updates the dirty
     // region of all screens presenting this layer stack.
     void invalidateLayerStack(uint32_t layerStack, const Region& dirty);
+
+    // allocate a h/w composer display id
+    int32_t allocateHwcDisplayId(DisplayDevice::DisplayType type);
 
     /* ------------------------------------------------------------------------
      * H/W composer
@@ -387,7 +389,7 @@ private:
     void dumpStatsLocked(const Vector<String16>& args, size_t& index,
         String8& result, char* buffer, size_t SIZE) const;
     void clearStatsLocked(const Vector<String16>& args, size_t& index,
-        String8& result, char* buffer, size_t SIZE) const;
+        String8& result, char* buffer, size_t SIZE);
     void dumpAllLocked(String8& result, char* buffer, size_t SIZE) const;
     bool startDdmConnection();
     static void appendSfConfigString(String8& result);
@@ -401,10 +403,10 @@ private:
     State mCurrentState;
     volatile int32_t mTransactionFlags;
     Condition mTransactionCV;
-    SortedVector<sp<LayerBase> > mLayerPurgatory;
     bool mTransactionPending;
     bool mAnimTransactionPending;
-    Vector<sp<LayerBase> > mLayersPendingRemoval;
+    Vector< sp<Layer> > mLayersPendingRemoval;
+    SortedVector< wp<IBinder> > mGraphicBufferProducerList;
 
     // protected by mStateLock (but we could use another lock)
     bool mLayersRemoved;
@@ -416,19 +418,22 @@ private:
     HWComposer* mHwc;
     GLuint mProtectedTexName;
     nsecs_t mBootTime;
+    bool mGpuToCpuSupported;
     sp<EventThread> mEventThread;
     GLint mMaxViewportDims[2];
     GLint mMaxTextureSize;
     EGLContext mEGLContext;
     EGLConfig mEGLConfig;
     EGLDisplay mEGLDisplay;
-    sp<IBinder> mDefaultDisplays[DisplayDevice::NUM_DISPLAY_TYPES];
+    EGLint mEGLNativeVisualId;
+    sp<IBinder> mBuiltinDisplays[DisplayDevice::NUM_DISPLAY_TYPES];
 
     // Can only accessed from the main thread, these members
     // don't need synchronization
     State mDrawingState;
     bool mVisibleRegionsDirty;
     bool mHwWorkListDirty;
+    bool mAnimCompositionPending;
 
     // this may only be written from the main thread with mStateLock held
     // it may be read from other threads with mStateLock held
@@ -448,10 +453,11 @@ private:
     // these are thread safe
     mutable MessageQueue mEventQueue;
     mutable Barrier mReadyToRunBarrier;
+    FrameTracker mAnimFrameTracker;
 
     // protected by mDestroyedLayerLock;
     mutable Mutex mDestroyedLayerLock;
-    Vector<LayerBase const *> mDestroyedLayers;
+    Vector<Layer const *> mDestroyedLayers;
 
     /* ------------------------------------------------------------------------
      * Feature prototyping
